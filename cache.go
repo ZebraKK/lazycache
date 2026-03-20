@@ -2,6 +2,8 @@ package lazycache
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"time"
@@ -16,23 +18,56 @@ type Cache[V any] struct {
 	maxBytes      int64
 	currentSize   int64
 	ttl           time.Duration
+	loaderTimeout time.Duration // 0 = no timeout
 	lru           *lruList
 	loaders       map[string]Loader[V]
 	sizeEstimator SizeEstimator[V]
 	stats         Statistics
 }
 
-// New creates a new Cache instance
-func New[V any](opts ...Option[V]) *Cache[V] {
+// isTransientError reports whether err represents a transient infrastructure
+// failure (loader panic or context timeout) rather than a business logic error.
+func isTransientError(err error) bool {
+	return errors.Is(err, ErrLoaderPanic) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// safeLoad calls loader.Load and converts any panic into an ErrLoaderPanic-wrapped error.
+func safeLoad[V any](ctx context.Context, loader Loader[V], key string) (v V, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: %v", ErrLoaderPanic, r)
+		}
+	}()
+	return loader.Load(ctx, key)
+}
+
+// callLoader wraps safeLoad with an optional timeout derived from the cache config.
+func (c *Cache[V]) callLoader(ctx context.Context, loader Loader[V], key string) (V, error) {
+	if c.loaderTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.loaderTimeout)
+		defer cancel()
+	}
+	return safeLoad(ctx, loader, key)
+}
+
+// New creates a new Cache instance with a mandatory default loader.
+// Additional loaders can be registered later via RegisterLoader.
+func New[V any](name string, loader Loader[V], opts ...Option[V]) *Cache[V] {
+	if loader == nil {
+		panic("lazycache: loader must not be nil")
+	}
 	c := &Cache[V]{
 		items:         make(map[string]*item[V]),
-		maxItems:      10000,              // default max items
-		maxBytes:      1 << 30,            // default 1GB
-		ttl:           5 * time.Minute,    // default 5 minutes
+		maxItems:      10000,           // default max items
+		maxBytes:      1 << 30,         // default 1GB
+		ttl:           5 * time.Minute, // default 5 minutes
 		lru:           newLRUList(),
 		loaders:       make(map[string]Loader[V]),
 		sizeEstimator: defaultSizeEstimator[V],
 	}
+
+	c.loaders[name] = loader
 
 	for _, opt := range opts {
 		opt(c)
@@ -43,6 +78,9 @@ func New[V any](opts ...Option[V]) *Cache[V] {
 
 // RegisterLoader registers a data loader with the given name
 func (c *Cache[V]) RegisterLoader(name string, loader Loader[V]) {
+	if loader == nil {
+		panic("lazycache: loader must not be nil")
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.loaders[name] = loader
@@ -59,19 +97,30 @@ func (c *Cache[V]) Get(ctx context.Context, key string, opts ...GetOption) (V, e
 
 	l := fromContext(ctx)
 
+	// Copy all fields we may need while holding the lock to avoid races with syncLoad/asyncRefresh.
 	c.mu.RLock()
 	it, exists := c.items[key]
+	var (
+		itValue   V
+		itIsNull  bool
+		itExpired bool
+	)
+	if exists {
+		itValue = it.value
+		itIsNull = it.isNull
+		itExpired = it.isExpired()
+	}
 	c.mu.RUnlock()
 
 	// Case 1: Cache hit and not expired
-	if exists && !it.isExpired() {
+	if exists && !itExpired {
 		c.lru.Touch(key)
 		c.stats.Hit()
 		l.Debug("cache hit", "key", key)
-		if it.isNull {
+		if itIsNull {
 			return zero[V](), ErrNotFound
 		}
-		return it.value, nil
+		return itValue, nil
 	}
 
 	l.Debug("cache miss", "key", key)
@@ -86,15 +135,12 @@ func (c *Cache[V]) Get(ctx context.Context, key string, opts ...GetOption) (V, e
 
 	// Case 2a: Has stale value and async mode (lazy loading core)
 	if exists && options.mode == AsyncMode {
-		// Capture the current state before launching async refresh
-		isNull := it.isNull
-		value := it.value
 		l.Debug("async refresh", "key", key, "loader", options.loaderName)
 		go c.asyncRefresh(context.Background(), key, loader, options.ttlOverride, l)
-		if isNull {
+		if itIsNull {
 			return zero[V](), ErrNotFound
 		}
-		return value, nil
+		return itValue, nil
 	}
 
 	// Case 2b: Sync mode or no stale value
@@ -222,7 +268,7 @@ func (c *Cache[V]) syncLoad(ctx context.Context, key string, loaderName string, 
 	c.mu.Unlock()
 
 	// Release lock and perform expensive load operation
-	value, err := loader.Load(ctx, key)
+	value, err := c.callLoader(ctx, loader, key)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -232,14 +278,41 @@ func (c *Cache[V]) syncLoad(ctx context.Context, key string, loaderName string, 
 		ttl = *ttlOverride
 	}
 
+	if err != nil && isTransientError(err) {
+		if exists && !it.isNull {
+			// Stale real value available: extend TTL and return it silently.
+			l.Warn("transient load error, using stale", "key", key, "error", err)
+			it.expireAt = time.Now().Add(ttl)
+			it.loading = false
+			close(it.loadChan)
+			c.lru.Touch(key)
+			c.evictIfNeeded()
+			return it.value, nil
+		}
+		// No usable stale value: null-cache with a short TTL so callers can retry quickly.
+		l.Error("transient load error, no stale value", "key", key, "error", err)
+		it.isNull = true
+		shortTTL := ttl / 10
+		if shortTTL > 30*time.Second {
+			shortTTL = 30 * time.Second
+		}
+		it.expireAt = time.Now().Add(shortTTL)
+		it.size = 0
+		it.loading = false
+		close(it.loadChan)
+		c.lru.Touch(key)
+		c.evictIfNeeded()
+		return zero[V](), fmt.Errorf("%w: %v", ErrUpdateFailed, err)
+	}
+
 	if err != nil {
-		// Load failed: cache as null to prevent cache penetration
+		// Non-transient error: null-cache to prevent cache penetration.
 		l.Error("load error", "key", key, "error", err)
 		it.isNull = true
 		it.expireAt = time.Now().Add(ttl)
 		it.size = 0
 	} else {
-		// Load succeeded
+		// Load succeeded.
 		l.Debug("load ok", "key", key)
 		it.value = value
 		it.isNull = false
@@ -274,7 +347,7 @@ func (c *Cache[V]) asyncRefresh(ctx context.Context, key string, loader Loader[V
 	c.mu.Unlock()
 
 	// Perform load without holding the lock
-	value, err := loader.Load(ctx, key)
+	value, err := c.callLoader(ctx, loader, key)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -285,9 +358,15 @@ func (c *Cache[V]) asyncRefresh(ctx context.Context, key string, loader Loader[V
 	}
 
 	if err != nil {
-		// Refresh failed: keep old value and extend expiration by 50%
-		l.Warn("refresh failed", "key", key, "error", err)
-		it.expireAt = time.Now().Add(ttl / 2)
+		if isTransientError(err) {
+			// Transient failure: stale value is always present in async path; extend to full TTL.
+			l.Warn("transient refresh error, keeping stale", "key", key, "error", err)
+			it.expireAt = time.Now().Add(ttl)
+		} else {
+			// Non-transient (business logic) error: extend by half TTL as before.
+			l.Warn("refresh failed", "key", key, "error", err)
+			it.expireAt = time.Now().Add(ttl / 2)
+		}
 		c.stats.RefreshFail()
 	} else {
 		// Refresh succeeded
@@ -322,13 +401,22 @@ func (c *Cache[V]) evictIfNeeded() {
 	}
 }
 
-// getLoader retrieves a loader by name
+// pickLoader randomly selects a loader from the registered loaders.
+// Must be called with c.mu.RLock held.
+func (c *Cache[V]) pickLoader() Loader[V] {
+	for _, l := range c.loaders {
+		return l
+	}
+	return nil
+}
+
+// getLoader retrieves a loader by name, or auto-selects one when name is empty.
 func (c *Cache[V]) getLoader(name string) Loader[V] {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	if name == "" {
-		return nil
+		return c.pickLoader()
 	}
 
 	loader, exists := c.loaders[name]

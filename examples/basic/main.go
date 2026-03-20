@@ -17,17 +17,10 @@ type User struct {
 func main() {
 	fmt.Println("=== LazyCache Basic Example ===\n")
 
-	// Create cache with configuration
-	cache := lazycache.New[*User](
-		lazycache.WithMaxItems[*User](100),
-		lazycache.WithMaxBytes[*User](1<<20), // 1MB
-		lazycache.WithTTL[*User](2*time.Second),
-	)
-
-	// Register a mock database loader
+	// Create cache with a mandatory default loader
 	loadCount := 0
-	cache.RegisterLoader("db", lazycache.LoaderFunc[*User](
-		func(ctx context.Context, key string) (*User, error) {
+	cache := lazycache.New[*User](
+		"db", lazycache.LoaderFunc[*User](func(ctx context.Context, key string) (*User, error) {
 			loadCount++
 			fmt.Printf("📦 Loading from DB (call #%d): %s\n", loadCount, key)
 			time.Sleep(100 * time.Millisecond) // Simulate slow DB query
@@ -36,8 +29,11 @@ func main() {
 				Name:  "User " + key,
 				Email: key + "@example.com",
 			}, nil
-		},
-	))
+		}),
+		lazycache.WithMaxItems[*User](100),
+		lazycache.WithMaxBytes[*User](1<<20), // 1MB
+		lazycache.WithTTL[*User](2*time.Second),
+	)
 
 	// Inject StdLogger so cache events are visible in the output
 	ctx := lazycache.NewContext(context.Background(), lazycache.StdLogger("[cache] "))

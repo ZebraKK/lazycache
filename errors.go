@@ -11,4 +11,11 @@ var (
 
 	// ErrLoaderNotFound is returned when specified loader name doesn't exist
 	ErrLoaderNotFound = errors.New("loader not found")
+
+	// ErrLoaderPanic is returned when a loader panics during execution
+	ErrLoaderPanic = errors.New("loader panicked")
+
+	// ErrUpdateFailed is returned when a transient error (panic/timeout) prevents
+	// loading a key and no stale cached value is available to fall back to.
+	ErrUpdateFailed = errors.New("cache update failed")
 )

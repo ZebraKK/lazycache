@@ -9,9 +9,18 @@ import (
 	"time"
 )
 
+// noopLoader is a loader that always returns ErrNotFound.
+// Used in tests where we only rely on pre-Set values and want cache misses to return errors.
+func noopLoader[V any]() Loader[V] {
+	return LoaderFunc[V](func(_ context.Context, _ string) (V, error) {
+		var z V
+		return z, ErrNotFound
+	})
+}
+
 // Test basic Get/Set operations
 func TestBasicGetSet(t *testing.T) {
-	cache := New[string]()
+	cache := New[string]("noop", noopLoader[string]())
 
 	// Set a value
 	cache.Set("key1", "value1")
@@ -34,10 +43,8 @@ func TestBasicGetSet(t *testing.T) {
 
 // Test cache miss with loader
 func TestCacheMissWithLoader(t *testing.T) {
-	cache := New[string]()
-
 	loadCount := 0
-	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
 		loadCount++
 		return "loaded_" + key, nil
 	}))
@@ -77,14 +84,12 @@ func TestCacheMissWithLoader(t *testing.T) {
 
 // Test lazy loading (async mode)
 func TestLazyLoading(t *testing.T) {
-	cache := New[string](WithTTL[string](100 * time.Millisecond))
-
 	loadCount := atomic.Int32{}
-	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
 		loadCount.Add(1)
 		time.Sleep(50 * time.Millisecond)
 		return "loaded_v" + key[len(key)-1:], nil
-	}))
+	}), WithTTL[string](100*time.Millisecond))
 
 	// Initial load (sync)
 	val, err := cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
@@ -125,10 +130,8 @@ func TestLazyLoading(t *testing.T) {
 
 // Test concurrent access with anti-stampede
 func TestAntiStampede(t *testing.T) {
-	cache := New[string]()
-
 	loadCount := atomic.Int32{}
-	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
 		loadCount.Add(1)
 		time.Sleep(100 * time.Millisecond)
 		return "loaded", nil
@@ -157,10 +160,8 @@ func TestAntiStampede(t *testing.T) {
 
 // Test null value caching (anti-penetration)
 func TestNullValueCaching(t *testing.T) {
-	cache := New[string]()
-
 	loadCount := 0
-	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
 		loadCount++
 		return "", errors.New("not found")
 	}))
@@ -186,7 +187,7 @@ func TestNullValueCaching(t *testing.T) {
 
 // Test LRU eviction by item count
 func TestLRUEvictionByCount(t *testing.T) {
-	cache := New[string](WithMaxItems[string](3))
+	cache := New[string]("noop", noopLoader[string](), WithMaxItems[string](3))
 
 	cache.Set("key1", "value1")
 	cache.Set("key2", "value2")
@@ -198,14 +199,14 @@ func TestLRUEvictionByCount(t *testing.T) {
 	// Add key4, should evict key2 (least recently used)
 	cache.Set("key4", "value4")
 
-	// key2 should be evicted
-	val, err := cache.Get(context.Background(), "key2")
+	// key2 should be evicted; use a non-registered loader to avoid null-caching side effects
+	val, err := cache.Get(context.Background(), "key2", WithLoader("_absent_"))
 	if err == nil || val != "" {
 		t.Fatal("key2 should have been evicted")
 	}
 
-	// key1 should still exist
-	val, err = cache.Get(context.Background(), "key1")
+	// key1 should still exist (cache hit, loader not invoked)
+	val, err = cache.Get(context.Background(), "key1", WithLoader("_absent_"))
 	if err != nil || val != "value1" {
 		t.Fatal("key1 should still be in cache")
 	}
@@ -224,6 +225,7 @@ func TestLRUEvictionBySize(t *testing.T) {
 	}
 
 	cache := New[string](
+		"noop", noopLoader[string](),
 		WithMaxItems[string](10),
 		WithMaxBytes[string](250), // Can fit 2.5 items
 		WithSizeEstimator[string](sizeEstimator),
@@ -246,7 +248,7 @@ func TestLRUEvictionBySize(t *testing.T) {
 
 // Test invalidation
 func TestInvalidate(t *testing.T) {
-	cache := New[string]()
+	cache := New[string]("noop", noopLoader[string]())
 	cache.Set("key1", "value1")
 
 	// Verify key exists
@@ -267,7 +269,7 @@ func TestInvalidate(t *testing.T) {
 
 // Test hot config update
 func TestConfigUpdate(t *testing.T) {
-	cache := New[string](WithMaxItems[string](10))
+	cache := New[string]("noop", noopLoader[string](), WithMaxItems[string](10))
 
 	// Add some items
 	for i := 0; i < 5; i++ {
@@ -289,11 +291,9 @@ func TestConfigUpdate(t *testing.T) {
 
 // Test TTL override
 func TestTTLOverride(t *testing.T) {
-	cache := New[string](WithTTL[string](1 * time.Second))
-
-	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
 		return "loaded", nil
-	}))
+	}), WithTTL[string](1*time.Second))
 
 	// Load with custom TTL
 	_, err := cache.Get(context.Background(), "key1",
@@ -321,16 +321,14 @@ func TestTTLOverride(t *testing.T) {
 
 // Test background refresh failure handling
 func TestRefreshFailure(t *testing.T) {
-	cache := New[string](WithTTL[string](100 * time.Millisecond))
-
 	attemptCount := atomic.Int32{}
-	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
 		count := attemptCount.Add(1)
 		if count == 1 {
 			return "initial", nil
 		}
 		return "", errors.New("refresh failed")
-	}))
+	}), WithTTL[string](100*time.Millisecond))
 
 	// Initial load
 	val, err := cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
@@ -364,9 +362,7 @@ func TestRefreshFailure(t *testing.T) {
 
 // Test multiple loaders
 func TestMultipleLoaders(t *testing.T) {
-	cache := New[string]()
-
-	cache.RegisterLoader("db", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+	cache := New[string]("db", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
 		return "from_db", nil
 	}))
 
@@ -396,9 +392,7 @@ func TestMultipleLoaders(t *testing.T) {
 
 // Test context cancellation
 func TestContextCancellation(t *testing.T) {
-	cache := New[string]()
-
-	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
@@ -418,9 +412,7 @@ func TestContextCancellation(t *testing.T) {
 
 // Test race conditions with -race flag
 func TestConcurrentAccess(t *testing.T) {
-	cache := New[int]()
-
-	cache.RegisterLoader("test", LoaderFunc[int](func(ctx context.Context, key string) (int, error) {
+	cache := New[int]("test", LoaderFunc[int](func(ctx context.Context, key string) (int, error) {
 		return 42, nil
 	}))
 
@@ -448,6 +440,39 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// TestAutoSelectLoader verifies that Get without WithLoader auto-selects a registered loader.
+func TestAutoSelectLoader(t *testing.T) {
+	cache := New[string]("loader1", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		return "from_loader1", nil
+	}))
+	cache.RegisterLoader("loader2", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		return "from_loader2", nil
+	}))
+
+	val, err := cache.Get(context.Background(), "key1", WithSync())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "from_loader1" && val != "from_loader2" {
+		t.Fatalf("expected value from one of the loaders, got %q", val)
+	}
+}
+
+// TestNewRequiresLoader verifies that a cache created with New works correctly via the default loader.
+func TestNewRequiresLoader(t *testing.T) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		return "loaded_" + key, nil
+	}))
+
+	val, err := cache.Get(context.Background(), "key1", WithSync())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if val != "loaded_key1" {
+		t.Fatalf("expected 'loaded_key1', got '%s'", val)
+	}
 }
 
 // mockLogger records log calls for assertions.
@@ -511,7 +536,7 @@ func (m *mockLogger) hasError(msg string) bool {
 
 // TestLoggerCacheHit verifies a Debug "cache hit" is emitted on a cache hit.
 func TestLoggerCacheHit(t *testing.T) {
-	cache := New[string]()
+	cache := New[string]("noop", noopLoader[string]())
 	cache.Set("key1", "value1")
 
 	ml := &mockLogger{}
@@ -528,9 +553,7 @@ func TestLoggerCacheHit(t *testing.T) {
 
 // TestLoggerCacheMiss verifies a Debug "cache miss" is emitted on a cache miss.
 func TestLoggerCacheMiss(t *testing.T) {
-	cache := New[string]()
-
-	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
 		return "loaded", nil
 	}))
 
@@ -552,9 +575,9 @@ func TestLoggerCacheMiss(t *testing.T) {
 	}
 }
 
-// TestLoggerNoLoader verifies an Error "no loader" is emitted when loader is missing.
+// TestLoggerNoLoader verifies an Error "no loader" is emitted when a named loader is missing.
 func TestLoggerNoLoader(t *testing.T) {
-	cache := New[string]()
+	cache := New[string]("noop", noopLoader[string]())
 
 	ml := &mockLogger{}
 	ctx := NewContext(context.Background(), ml)
@@ -570,9 +593,7 @@ func TestLoggerNoLoader(t *testing.T) {
 
 // TestLoggerLoadError verifies an Error "load error" is emitted when loader fails.
 func TestLoggerLoadError(t *testing.T) {
-	cache := New[string]()
-
-	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
 		return "", errors.New("db down")
 	}))
 
@@ -587,11 +608,9 @@ func TestLoggerLoadError(t *testing.T) {
 
 // TestLoggerAsyncRefresh verifies Debug "async refresh" and "refresh ok" on background refresh.
 func TestLoggerAsyncRefresh(t *testing.T) {
-	cache := New[string](WithTTL[string](50 * time.Millisecond))
-
-	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
 		return "refreshed", nil
-	}))
+	}), WithTTL[string](50*time.Millisecond))
 
 	// Prime the cache synchronously.
 	cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
@@ -619,15 +638,13 @@ func TestLoggerAsyncRefresh(t *testing.T) {
 
 // TestLoggerRefreshFailed verifies Warn "refresh failed" when background refresh errors.
 func TestLoggerRefreshFailed(t *testing.T) {
-	cache := New[string](WithTTL[string](50 * time.Millisecond))
-
 	attempt := atomic.Int32{}
-	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
 		if attempt.Add(1) == 1 {
 			return "initial", nil
 		}
 		return "", errors.New("refresh error")
-	}))
+	}), WithTTL[string](50*time.Millisecond))
 
 	// Prime the cache.
 	cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
@@ -649,7 +666,7 @@ func TestLoggerRefreshFailed(t *testing.T) {
 
 // TestLoggerNoop verifies no-op logger (default) causes no panic and no overhead path.
 func TestLoggerNoop(t *testing.T) {
-	cache := New[string]()
+	cache := New[string]("noop", noopLoader[string]())
 	cache.Set("key1", "value1")
 
 	// No logger in context → noopLogger, must not panic.
@@ -659,9 +676,410 @@ func TestLoggerNoop(t *testing.T) {
 	}
 }
 
+// TestLoaderPanicSync verifies that a loader panic in syncLoad is recovered, returns
+// ErrUpdateFailed (no stale value), and does not leave waiting goroutines permanently blocked.
+func TestLoaderPanicSync(t *testing.T) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		panic("boom")
+	}))
+
+	_, err := cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	if err == nil {
+		t.Fatal("expected error from panicking loader")
+	}
+	if !errors.Is(err, ErrUpdateFailed) {
+		t.Fatalf("expected ErrUpdateFailed, got: %v", err)
+	}
+
+	// A second Get must not hang — loadChan was closed despite the panic.
+	done := make(chan struct{})
+	go func() {
+		cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("second Get after loader panic hung indefinitely")
+	}
+}
+
+// TestLoaderPanicAsync verifies that a loader panic during asyncRefresh is recovered,
+// increments RefreshFail, and clears it.loading so the key can refresh again.
+func TestLoaderPanicAsync(t *testing.T) {
+	attempt := atomic.Int32{}
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		n := attempt.Add(1)
+		if n == 1 {
+			return "initial", nil
+		}
+		panic("async boom")
+	}), WithTTL[string](50*time.Millisecond))
+
+	// Prime the cache.
+	_, err := cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	if err != nil {
+		t.Fatalf("unexpected error on initial load: %v", err)
+	}
+
+	// Wait for TTL to expire.
+	time.Sleep(80 * time.Millisecond)
+
+	// Async get — triggers background refresh that will panic.
+	val, err := cache.Get(context.Background(), "key1", WithLoader("test"))
+	if err != nil {
+		t.Fatalf("unexpected error on async get: %v", err)
+	}
+	if val != "initial" {
+		t.Fatalf("expected stale 'initial', got %q", val)
+	}
+
+	// Wait for background goroutine to finish.
+	time.Sleep(100 * time.Millisecond)
+
+	stats := cache.Stats()
+	if stats.RefreshFail == 0 {
+		t.Fatal("expected RefreshFail to be incremented after async loader panic")
+	}
+
+	// it.loading must be cleared — a new Get must not hang.
+	cache.mu.RLock()
+	it := cache.items["key1"]
+	loading := it.loading
+	cache.mu.RUnlock()
+	if loading {
+		t.Fatal("it.loading should be false after async loader panic")
+	}
+}
+
+// TestLoaderTimeout verifies that WithLoaderTimeout causes Get to return
+// ErrUpdateFailed (wrapping the timeout) when the loader exceeds the configured timeout
+// and no stale value exists.
+func TestLoaderTimeout(t *testing.T) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+			return "loaded", nil
+		}
+	}), WithLoaderTimeout[string](50*time.Millisecond))
+
+	start := time.Now()
+	_, err := cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !errors.Is(err, ErrUpdateFailed) {
+		t.Fatalf("expected ErrUpdateFailed, got: %v", err)
+	}
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("Get took too long (%v), expected ~50ms", elapsed)
+	}
+}
+
+// TestNilLoaderPanic verifies that passing a nil loader to New or RegisterLoader panics.
+func TestNilLoaderPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic from New with nil loader")
+		}
+	}()
+	New[string]("test", nil)
+}
+
+func TestNilRegisterLoaderPanic(t *testing.T) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		return "ok", nil
+	}))
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic from RegisterLoader with nil loader")
+		}
+	}()
+	cache.RegisterLoader("other", nil)
+}
+
+// TestSyncLoadPanicWithStale verifies that when a stale value exists and the loader
+// panics, the stale value is returned with nil error and its TTL is extended.
+func TestSyncLoadPanicWithStale(t *testing.T) {
+	attempt := atomic.Int32{}
+	ttl := 100 * time.Millisecond
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		if attempt.Add(1) == 1 {
+			return "initial", nil
+		}
+		panic("boom")
+	}), WithTTL[string](ttl))
+
+	// Prime the cache.
+	val, err := cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	if err != nil || val != "initial" {
+		t.Fatalf("unexpected: val=%q err=%v", val, err)
+	}
+
+	// Wait for expiration.
+	time.Sleep(150 * time.Millisecond)
+
+	// Sync load with panicking loader — should return stale value.
+	val, err = cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	if err != nil {
+		t.Fatalf("expected nil error (stale fallback), got: %v", err)
+	}
+	if val != "initial" {
+		t.Fatalf("expected stale 'initial', got %q", val)
+	}
+
+	// TTL should be extended (item should not be expired yet).
+	cache.mu.RLock()
+	it := cache.items["key1"]
+	expired := it.isExpired()
+	cache.mu.RUnlock()
+	if expired {
+		t.Fatal("expected TTL to be extended after transient error with stale value")
+	}
+}
+
+// TestSyncLoadTimeoutWithStale verifies that when a stale value exists and the loader
+// times out, the stale value is returned with nil error and its TTL is extended.
+func TestSyncLoadTimeoutWithStale(t *testing.T) {
+	attempt := atomic.Int32{}
+	ttl := 100 * time.Millisecond
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		if attempt.Add(1) == 1 {
+			return "initial", nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(1 * time.Second):
+			return "late", nil
+		}
+	}), WithTTL[string](ttl), WithLoaderTimeout[string](50*time.Millisecond))
+
+	// Prime the cache.
+	val, err := cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	if err != nil || val != "initial" {
+		t.Fatalf("unexpected: val=%q err=%v", val, err)
+	}
+
+	// Wait for expiration.
+	time.Sleep(150 * time.Millisecond)
+
+	// Sync load with timing-out loader — should return stale value.
+	val, err = cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	if err != nil {
+		t.Fatalf("expected nil error (stale fallback), got: %v", err)
+	}
+	if val != "initial" {
+		t.Fatalf("expected stale 'initial', got %q", val)
+	}
+
+	// TTL should be extended.
+	cache.mu.RLock()
+	it := cache.items["key1"]
+	expired := it.isExpired()
+	cache.mu.RUnlock()
+	if expired {
+		t.Fatal("expected TTL to be extended after transient timeout with stale value")
+	}
+}
+
+// TestSyncLoadPanicNoStale verifies that when no stale value exists and the loader
+// panics, ErrUpdateFailed is returned and the item is null-cached with a short TTL.
+func TestSyncLoadPanicNoStale(t *testing.T) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		panic("infra down")
+	}), WithTTL[string](5*time.Minute))
+
+	_, err := cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, ErrUpdateFailed) {
+		t.Fatalf("expected ErrUpdateFailed, got: %v", err)
+	}
+
+	// Item should be null-cached with a short TTL (≤30s, not the full 5 minutes).
+	cache.mu.RLock()
+	it := cache.items["key1"]
+	ttlRemaining := time.Until(it.expireAt)
+	isNull := it.isNull
+	cache.mu.RUnlock()
+
+	if !isNull {
+		t.Fatal("expected item to be null-cached")
+	}
+	if ttlRemaining > 31*time.Second {
+		t.Fatalf("expected short null-cache TTL (≤30s), got %v remaining", ttlRemaining)
+	}
+}
+
+// TestSyncLoadTimeoutNoStale verifies that when no stale value exists and the loader
+// times out, ErrUpdateFailed is returned with a short null-cache TTL.
+func TestSyncLoadTimeoutNoStale(t *testing.T) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(1 * time.Second):
+			return "late", nil
+		}
+	}), WithTTL[string](5*time.Minute), WithLoaderTimeout[string](50*time.Millisecond))
+
+	_, err := cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, ErrUpdateFailed) {
+		t.Fatalf("expected ErrUpdateFailed, got: %v", err)
+	}
+
+	cache.mu.RLock()
+	it := cache.items["key1"]
+	ttlRemaining := time.Until(it.expireAt)
+	isNull := it.isNull
+	cache.mu.RUnlock()
+
+	if !isNull {
+		t.Fatal("expected item to be null-cached")
+	}
+	if ttlRemaining > 31*time.Second {
+		t.Fatalf("expected short null-cache TTL (≤30s), got %v remaining", ttlRemaining)
+	}
+}
+
+// TestAsyncRefreshPanic verifies that a panic during asyncRefresh extends the TTL to
+// the full value (not ttl/2) since the stale value is kept.
+func TestAsyncRefreshPanic(t *testing.T) {
+	attempt := atomic.Int32{}
+	ttl := 2 * time.Second
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		if attempt.Add(1) == 1 {
+			return "initial", nil
+		}
+		panic("async boom")
+	}), WithTTL[string](ttl))
+
+	// Prime the cache.
+	cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+
+	// Force expiry by back-dating the item.
+	cache.mu.Lock()
+	cache.items["key1"].expireAt = time.Now().Add(-1 * time.Millisecond)
+	cache.mu.Unlock()
+
+	// Trigger async refresh (panicking loader).
+	val, err := cache.Get(context.Background(), "key1", WithLoader("test"))
+	if err != nil || val != "initial" {
+		t.Fatalf("expected stale value, got val=%q err=%v", val, err)
+	}
+
+	// Wait for background goroutine to finish.
+	time.Sleep(100 * time.Millisecond)
+
+	// TTL should be extended to full ttl (≈2s remaining), not ttl/2 (≈1s).
+	cache.mu.RLock()
+	it := cache.items["key1"]
+	ttlRemaining := time.Until(it.expireAt)
+	cache.mu.RUnlock()
+
+	if ttlRemaining < ttl/2 {
+		t.Fatalf("expected TTL extended to full %v, got only %v remaining", ttl, ttlRemaining)
+	}
+
+	stats := cache.Stats()
+	if stats.RefreshFail == 0 {
+		t.Fatal("expected RefreshFail to be incremented")
+	}
+}
+
+// TestAsyncRefreshTimeout verifies that a timeout during asyncRefresh extends TTL to
+// full value (not ttl/2).
+func TestAsyncRefreshTimeout(t *testing.T) {
+	attempt := atomic.Int32{}
+	ttl := 2 * time.Second
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		if attempt.Add(1) == 1 {
+			return "initial", nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(1 * time.Second):
+			return "late", nil
+		}
+	}), WithTTL[string](ttl), WithLoaderTimeout[string](50*time.Millisecond))
+
+	// Prime the cache.
+	cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+
+	// Force expiry by back-dating the item.
+	cache.mu.Lock()
+	cache.items["key1"].expireAt = time.Now().Add(-1 * time.Millisecond)
+	cache.mu.Unlock()
+
+	// Trigger async refresh (timing-out loader).
+	val, err := cache.Get(context.Background(), "key1", WithLoader("test"))
+	if err != nil || val != "initial" {
+		t.Fatalf("expected stale value, got val=%q err=%v", val, err)
+	}
+
+	// Wait for background goroutine to finish.
+	time.Sleep(150 * time.Millisecond)
+
+	// TTL should be extended to full ttl (≈2s remaining), not ttl/2 (≈1s).
+	cache.mu.RLock()
+	it := cache.items["key1"]
+	ttlRemaining := time.Until(it.expireAt)
+	cache.mu.RUnlock()
+
+	if ttlRemaining < ttl/2 {
+		t.Fatalf("expected TTL extended to full %v, got only %v remaining", ttl, ttlRemaining)
+	}
+
+	stats := cache.Stats()
+	if stats.RefreshFail == 0 {
+		t.Fatal("expected RefreshFail to be incremented")
+	}
+}
+
+// TestNonTransientErrorUnchanged verifies that non-transient errors still null-cache
+// with the full TTL (existing behavior).
+func TestNonTransientErrorUnchanged(t *testing.T) {
+	cache := New[string]("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		return "", errors.New("not found")
+	}), WithTTL[string](5*time.Minute))
+
+	_, err := cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if errors.Is(err, ErrUpdateFailed) {
+		t.Fatal("non-transient error should not be wrapped in ErrUpdateFailed")
+	}
+
+	// Null-cached with full TTL (~5 minutes).
+	cache.mu.RLock()
+	it := cache.items["key1"]
+	ttlRemaining := time.Until(it.expireAt)
+	isNull := it.isNull
+	cache.mu.RUnlock()
+
+	if !isNull {
+		t.Fatal("expected item to be null-cached")
+	}
+	// Full TTL: should be close to 5 minutes (well over 30s).
+	if ttlRemaining < 4*time.Minute {
+		t.Fatalf("expected full TTL (~5min) for non-transient error, got %v", ttlRemaining)
+	}
+}
+
 // Benchmark Get operations
 func BenchmarkCacheGet(b *testing.B) {
-	cache := New[string]()
+	cache := New[string]("noop", noopLoader[string]())
 	cache.Set("key", "value")
 
 	b.ResetTimer()
@@ -672,7 +1090,7 @@ func BenchmarkCacheGet(b *testing.B) {
 
 // Benchmark Set operations
 func BenchmarkCacheSet(b *testing.B) {
-	cache := New[string]()
+	cache := New[string]("noop", noopLoader[string]())
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -682,7 +1100,7 @@ func BenchmarkCacheSet(b *testing.B) {
 
 // Benchmark concurrent access
 func BenchmarkCacheConcurrent(b *testing.B) {
-	cache := New[string]()
+	cache := New[string]("noop", noopLoader[string]())
 	cache.Set("key", "value")
 
 	b.RunParallel(func(pb *testing.PB) {

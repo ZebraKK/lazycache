@@ -36,6 +36,13 @@ func WithSizeEstimator[V any](fn SizeEstimator[V]) Option[V] {
 	}
 }
 
+// WithLoaderTimeout sets a timeout for loader calls. Zero means no timeout.
+func WithLoaderTimeout[V any](d time.Duration) Option[V] {
+	return func(c *Cache[V]) {
+		c.loaderTimeout = d
+	}
+}
+
 // LoadMode determines how cache loading behaves
 type LoadMode int
 
