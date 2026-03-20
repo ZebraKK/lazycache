@@ -450,6 +450,215 @@ func TestConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
+// mockLogger records log calls for assertions.
+type mockLogger struct {
+	mu     sync.Mutex
+	debug  []string
+	warns  []string
+	errors []string
+}
+
+func (m *mockLogger) Debug(msg string, args ...any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.debug = append(m.debug, msg)
+}
+
+func (m *mockLogger) Warn(msg string, args ...any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.warns = append(m.warns, msg)
+}
+
+func (m *mockLogger) Error(msg string, args ...any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.errors = append(m.errors, msg)
+}
+
+func (m *mockLogger) hasDebug(msg string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.debug {
+		if s == msg {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *mockLogger) hasWarn(msg string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.warns {
+		if s == msg {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *mockLogger) hasError(msg string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.errors {
+		if s == msg {
+			return true
+		}
+	}
+	return false
+}
+
+// TestLoggerCacheHit verifies a Debug "cache hit" is emitted on a cache hit.
+func TestLoggerCacheHit(t *testing.T) {
+	cache := New[string]()
+	cache.Set("key1", "value1")
+
+	ml := &mockLogger{}
+	ctx := NewContext(context.Background(), ml)
+
+	_, err := cache.Get(ctx, "key1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ml.hasDebug("cache hit") {
+		t.Fatal("expected 'cache hit' debug log")
+	}
+}
+
+// TestLoggerCacheMiss verifies a Debug "cache miss" is emitted on a cache miss.
+func TestLoggerCacheMiss(t *testing.T) {
+	cache := New[string]()
+
+	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		return "loaded", nil
+	}))
+
+	ml := &mockLogger{}
+	ctx := NewContext(context.Background(), ml)
+
+	_, err := cache.Get(ctx, "key1", WithLoader("test"), WithSync())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ml.hasDebug("cache miss") {
+		t.Fatal("expected 'cache miss' debug log")
+	}
+	if !ml.hasDebug("sync load") {
+		t.Fatal("expected 'sync load' debug log")
+	}
+	if !ml.hasDebug("load ok") {
+		t.Fatal("expected 'load ok' debug log")
+	}
+}
+
+// TestLoggerNoLoader verifies an Error "no loader" is emitted when loader is missing.
+func TestLoggerNoLoader(t *testing.T) {
+	cache := New[string]()
+
+	ml := &mockLogger{}
+	ctx := NewContext(context.Background(), ml)
+
+	_, err := cache.Get(ctx, "key1", WithLoader("missing"))
+	if err == nil {
+		t.Fatal("expected ErrNoLoader")
+	}
+	if !ml.hasError("no loader") {
+		t.Fatal("expected 'no loader' error log")
+	}
+}
+
+// TestLoggerLoadError verifies an Error "load error" is emitted when loader fails.
+func TestLoggerLoadError(t *testing.T) {
+	cache := New[string]()
+
+	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		return "", errors.New("db down")
+	}))
+
+	ml := &mockLogger{}
+	ctx := NewContext(context.Background(), ml)
+
+	_, _ = cache.Get(ctx, "key1", WithLoader("test"), WithSync())
+	if !ml.hasError("load error") {
+		t.Fatal("expected 'load error' error log")
+	}
+}
+
+// TestLoggerAsyncRefresh verifies Debug "async refresh" and "refresh ok" on background refresh.
+func TestLoggerAsyncRefresh(t *testing.T) {
+	cache := New[string](WithTTL[string](50 * time.Millisecond))
+
+	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		return "refreshed", nil
+	}))
+
+	// Prime the cache synchronously.
+	cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+
+	// Wait for TTL to expire.
+	time.Sleep(80 * time.Millisecond)
+
+	ml := &mockLogger{}
+	ctx := NewContext(context.Background(), ml)
+
+	// Async get on expired key.
+	cache.Get(ctx, "key1", WithLoader("test"))
+
+	if !ml.hasDebug("async refresh") {
+		t.Fatal("expected 'async refresh' debug log")
+	}
+
+	// Wait for background goroutine to finish.
+	time.Sleep(50 * time.Millisecond)
+
+	if !ml.hasDebug("refresh ok") {
+		t.Fatal("expected 'refresh ok' debug log")
+	}
+}
+
+// TestLoggerRefreshFailed verifies Warn "refresh failed" when background refresh errors.
+func TestLoggerRefreshFailed(t *testing.T) {
+	cache := New[string](WithTTL[string](50 * time.Millisecond))
+
+	attempt := atomic.Int32{}
+	cache.RegisterLoader("test", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		if attempt.Add(1) == 1 {
+			return "initial", nil
+		}
+		return "", errors.New("refresh error")
+	}))
+
+	// Prime the cache.
+	cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+
+	time.Sleep(80 * time.Millisecond)
+
+	ml := &mockLogger{}
+	ctx := NewContext(context.Background(), ml)
+
+	cache.Get(ctx, "key1", WithLoader("test"))
+
+	// Wait for background goroutine.
+	time.Sleep(50 * time.Millisecond)
+
+	if !ml.hasWarn("refresh failed") {
+		t.Fatal("expected 'refresh failed' warn log")
+	}
+}
+
+// TestLoggerNoop verifies no-op logger (default) causes no panic and no overhead path.
+func TestLoggerNoop(t *testing.T) {
+	cache := New[string]()
+	cache.Set("key1", "value1")
+
+	// No logger in context → noopLogger, must not panic.
+	_, err := cache.Get(context.Background(), "key1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // Benchmark Get operations
 func BenchmarkCacheGet(b *testing.B) {
 	cache := New[string]()

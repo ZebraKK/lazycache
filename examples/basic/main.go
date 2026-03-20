@@ -39,7 +39,8 @@ func main() {
 		},
 	))
 
-	ctx := context.Background()
+	// Inject StdLogger so cache events are visible in the output
+	ctx := lazycache.NewContext(context.Background(), lazycache.StdLogger("[cache] "))
 
 	// Example 1: Initial load (cache miss)
 	fmt.Println("1️⃣  First Get (cache miss, sync load):")

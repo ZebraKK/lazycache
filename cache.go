@@ -57,6 +57,8 @@ func (c *Cache[V]) Get(ctx context.Context, key string, opts ...GetOption) (V, e
 		opt(options)
 	}
 
+	l := fromContext(ctx)
+
 	c.mu.RLock()
 	it, exists := c.items[key]
 	c.mu.RUnlock()
@@ -65,17 +67,20 @@ func (c *Cache[V]) Get(ctx context.Context, key string, opts ...GetOption) (V, e
 	if exists && !it.isExpired() {
 		c.lru.Touch(key)
 		c.stats.Hit()
+		l.Debug("cache hit", "key", key)
 		if it.isNull {
 			return zero[V](), ErrNotFound
 		}
 		return it.value, nil
 	}
 
+	l.Debug("cache miss", "key", key)
 	c.stats.Miss()
 
 	// Case 2: Need to load
 	loader := c.getLoader(options.loaderName)
 	if loader == nil {
+		l.Error("no loader", "key", key)
 		return zero[V](), ErrNoLoader
 	}
 
@@ -84,7 +89,8 @@ func (c *Cache[V]) Get(ctx context.Context, key string, opts ...GetOption) (V, e
 		// Capture the current state before launching async refresh
 		isNull := it.isNull
 		value := it.value
-		go c.asyncRefresh(context.Background(), key, loader, options.ttlOverride)
+		l.Debug("async refresh", "key", key, "loader", options.loaderName)
+		go c.asyncRefresh(context.Background(), key, loader, options.ttlOverride, l)
 		if isNull {
 			return zero[V](), ErrNotFound
 		}
@@ -92,7 +98,7 @@ func (c *Cache[V]) Get(ctx context.Context, key string, opts ...GetOption) (V, e
 	}
 
 	// Case 2b: Sync mode or no stale value
-	return c.syncLoad(ctx, key, loader, options.ttlOverride)
+	return c.syncLoad(ctx, key, options.loaderName, loader, options.ttlOverride)
 }
 
 // Set manually sets a cache value
@@ -178,7 +184,10 @@ func (c *Cache[V]) Size() int64 {
 }
 
 // syncLoad loads a value synchronously with anti-stampede protection
-func (c *Cache[V]) syncLoad(ctx context.Context, key string, loader Loader[V], ttlOverride *time.Duration) (V, error) {
+func (c *Cache[V]) syncLoad(ctx context.Context, key string, loaderName string, loader Loader[V], ttlOverride *time.Duration) (V, error) {
+	l := fromContext(ctx)
+	l.Debug("sync load", "key", key, "loader", loaderName)
+
 	c.mu.Lock()
 
 	it, exists := c.items[key]
@@ -225,11 +234,13 @@ func (c *Cache[V]) syncLoad(ctx context.Context, key string, loader Loader[V], t
 
 	if err != nil {
 		// Load failed: cache as null to prevent cache penetration
+		l.Error("load error", "key", key, "error", err)
 		it.isNull = true
 		it.expireAt = time.Now().Add(ttl)
 		it.size = 0
 	} else {
 		// Load succeeded
+		l.Debug("load ok", "key", key)
 		it.value = value
 		it.isNull = false
 		it.expireAt = time.Now().Add(ttl)
@@ -250,7 +261,7 @@ func (c *Cache[V]) syncLoad(ctx context.Context, key string, loader Loader[V], t
 }
 
 // asyncRefresh refreshes a cache entry in the background
-func (c *Cache[V]) asyncRefresh(ctx context.Context, key string, loader Loader[V], ttlOverride *time.Duration) {
+func (c *Cache[V]) asyncRefresh(ctx context.Context, key string, loader Loader[V], ttlOverride *time.Duration, l Logger) {
 	c.mu.Lock()
 	it, exists := c.items[key]
 	if !exists || it.loading {
@@ -275,10 +286,12 @@ func (c *Cache[V]) asyncRefresh(ctx context.Context, key string, loader Loader[V
 
 	if err != nil {
 		// Refresh failed: keep old value and extend expiration by 50%
+		l.Warn("refresh failed", "key", key, "error", err)
 		it.expireAt = time.Now().Add(ttl / 2)
 		c.stats.RefreshFail()
 	} else {
 		// Refresh succeeded
+		l.Debug("refresh ok", "key", key)
 		it.value = value
 		it.isNull = false
 		it.expireAt = time.Now().Add(ttl)
