@@ -19,7 +19,7 @@ type Cache[V any] struct {
 	currentSize   int64
 	ttl           time.Duration
 	loaderTimeout time.Duration // 0 = no timeout
-	lru           *lruList
+	lru           *lruList[V]
 	loaders       map[string]Loader[V]
 	sizeEstimator SizeEstimator[V]
 	stats         Statistics
@@ -62,7 +62,7 @@ func New[V any](name string, loader Loader[V], opts ...Option[V]) *Cache[V] {
 		maxItems:      10000,           // default max items
 		maxBytes:      1 << 30,         // default 1GB
 		ttl:           5 * time.Minute, // default 5 minutes
-		lru:           newLRUList(),
+		lru:           newLRUList[V](),
 		loaders:       make(map[string]Loader[V]),
 		sizeEstimator: defaultSizeEstimator[V],
 	}
@@ -114,7 +114,7 @@ func (c *Cache[V]) Get(ctx context.Context, key string, opts ...GetOption) (V, e
 
 	// Case 1: Cache hit and not expired
 	if exists && !itExpired {
-		c.lru.Touch(key)
+		c.lru.MaybeTouch(it)
 		c.stats.Hit()
 		l.Debug("cache hit", "key", key)
 		if itIsNull {
@@ -171,7 +171,7 @@ func (c *Cache[V]) Set(key string, value V, opts ...SetOption) {
 	if exists {
 		c.currentSize -= it.size
 	} else {
-		it = &item[V]{}
+		it = &item[V]{key: key}
 		c.items[key] = it
 	}
 
@@ -182,7 +182,7 @@ func (c *Cache[V]) Set(key string, value V, opts ...SetOption) {
 	it.loading = false
 
 	c.currentSize += size
-	c.lru.Touch(key)
+	c.lru.Touch(it)
 	c.evictIfNeeded()
 }
 
@@ -194,7 +194,7 @@ func (c *Cache[V]) Invalidate(key string) {
 	if it, exists := c.items[key]; exists {
 		c.currentSize -= it.size
 		delete(c.items, key)
-		c.lru.Remove(key)
+		c.lru.Remove(it)
 	}
 }
 
@@ -260,7 +260,7 @@ func (c *Cache[V]) syncLoad(ctx context.Context, key string, loaderName string, 
 
 	// This goroutine is responsible for loading
 	if !exists {
-		it = &item[V]{}
+		it = &item[V]{key: key}
 		c.items[key] = it
 	}
 	it.loading = true
@@ -285,7 +285,7 @@ func (c *Cache[V]) syncLoad(ctx context.Context, key string, loaderName string, 
 			it.expireAt = time.Now().Add(ttl)
 			it.loading = false
 			close(it.loadChan)
-			c.lru.Touch(key)
+			c.lru.Touch(it)
 			c.evictIfNeeded()
 			return it.value, nil
 		}
@@ -300,7 +300,7 @@ func (c *Cache[V]) syncLoad(ctx context.Context, key string, loaderName string, 
 		it.size = 0
 		it.loading = false
 		close(it.loadChan)
-		c.lru.Touch(key)
+		c.lru.Touch(it)
 		c.evictIfNeeded()
 		return zero[V](), fmt.Errorf("%w: %v", ErrUpdateFailed, err)
 	}
@@ -324,7 +324,7 @@ func (c *Cache[V]) syncLoad(ctx context.Context, key string, loaderName string, 
 	it.loading = false
 	close(it.loadChan)
 
-	c.lru.Touch(key)
+	c.lru.Touch(it)
 	c.evictIfNeeded()
 
 	if it.isNull {
@@ -389,15 +389,13 @@ func (c *Cache[V]) evictIfNeeded() {
 	// Evict until both limits are satisfied
 	for len(c.items) > c.maxItems || c.currentSize > c.maxBytes {
 		victim := c.lru.RemoveLast()
-		if victim == "" {
+		if victim == nil {
 			break
 		}
 
-		if it, ok := c.items[victim]; ok {
-			c.currentSize -= it.size
-			delete(c.items, victim)
-			c.stats.Evict()
-		}
+		c.currentSize -= victim.size
+		delete(c.items, victim.key)
+		c.stats.Evict()
 	}
 }
 

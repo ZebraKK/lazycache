@@ -1077,6 +1077,69 @@ func TestNonTransientErrorUnchanged(t *testing.T) {
 	}
 }
 
+// TestMaybeTouchLRUPrecision verifies the MaybeTouch read-throttle semantics:
+//   - The first read after a write (n==1) immediately updates LRU order.
+//   - Subsequent reads within the same burst are throttled (no lock acquired).
+//   - After every touchEveryN reads, LRU order is updated again.
+func TestMaybeTouchLRUPrecision(t *testing.T) {
+	// maxItems=2 so the 3rd Set triggers eviction of the LRU tail.
+	cache := New[string]("noop", noopLoader[string](), WithMaxItems[string](2))
+
+	cache.Set("key1", "v1")
+	cache.Set("key2", "v2")
+	// LRU order: [key2(MRU), key1(LRU)]
+
+	// First read of key1 after its Set → n==1 → Touch → key1 becomes MRU.
+	cache.Get(context.Background(), "key1")
+	// LRU order should now be: [key1(MRU), key2(LRU)]
+
+	// Adding key3 must evict key2 (LRU), not key1.
+	cache.Set("key3", "v3")
+
+	_, err := cache.Get(context.Background(), "key2", WithLoader("_absent_"))
+	if err == nil {
+		t.Fatal("key2 should have been evicted after first read of key1 moved it to MRU")
+	}
+	_, err = cache.Get(context.Background(), "key1", WithLoader("_absent_"))
+	if err != nil {
+		t.Fatal("key1 should still be in cache")
+	}
+
+	// Verify throttling: reads 2..touchEveryN-1 do NOT update LRU order.
+	//
+	// Setup:
+	//   Set keyA, Set keyB → LRU: [keyB(MRU), keyA(LRU)]
+	//   Read keyA once  (n=1 → Touch) → LRU: [keyA(MRU), keyB(LRU)]
+	//   Read keyB once  (n=1 → Touch) → LRU: [keyB(MRU), keyA(LRU)]
+	//   Now read keyA (touchEveryN-2) more times (reads 2..touchEveryN-1):
+	//     all throttled → keyA stays as LRU.
+	//   Set keyC → evict keyA (still LRU despite multiple reads).
+	cache2 := New[string]("noop", noopLoader[string](), WithMaxItems[string](2))
+	cache2.Set("keyA", "vA")
+	cache2.Set("keyB", "vB")
+	// LRU: [keyB(MRU), keyA(LRU)]
+
+	cache2.Get(context.Background(), "keyA") // n=1 → Touch → LRU: [keyA, keyB]
+	cache2.Get(context.Background(), "keyB") // n=1 → Touch → LRU: [keyB, keyA]
+
+	// Reads 2..touchEveryN-1 of keyA: all throttled, no Touch, keyA stays LRU.
+	for i := 0; i < touchEveryN-2; i++ {
+		cache2.Get(context.Background(), "keyA")
+	}
+	// keyA.readCount == touchEveryN-1; next read would be touchEveryN (Touch fires).
+	// But we stop here: keyA is still LRU.
+	cache2.Set("keyC", "vC") // triggers eviction of keyA (LRU tail)
+
+	_, err = cache2.Get(context.Background(), "keyA", WithLoader("_absent_"))
+	if err == nil {
+		t.Fatal("keyA should have been evicted; reads 2..touchEveryN-1 are throttled")
+	}
+	_, err = cache2.Get(context.Background(), "keyB", WithLoader("_absent_"))
+	if err != nil {
+		t.Fatal("keyB should still be in cache")
+	}
+}
+
 // Benchmark Get operations
 func BenchmarkCacheGet(b *testing.B) {
 	cache := New[string]("noop", noopLoader[string]())
