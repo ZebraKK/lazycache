@@ -295,14 +295,14 @@ go test -bench=. -benchmem
 ## 关键文件路径
 
 实现时需要创建的文件：
-- `/Users/xiaowyu/xwill/lazycache/go.mod` - Go module 初始化
-- `/Users/xiaowyu/xwill/lazycache/cache.go` - 核心缓存逻辑（约 300 行）
-- `/Users/xiaowyu/xwill/lazycache/item.go` - Item 定义（约 30 行）
-- `/Users/xiaowyu/xwill/lazycache/lru.go` - LRU 实现（约 100 行）
-- `/Users/xiaowyu/xwill/lazycache/loader.go` - Loader 接口（约 20 行）
-- `/Users/xiaowyu/xwill/lazycache/options.go` - Options 定义（约 80 行）
-- `/Users/xiaowyu/xwill/lazycache/stats.go` - 统计功能（约 50 行）
-- `/Users/xiaowyu/xwill/lazycache/errors.go` - 错误定义（约 15 行）
-- `/Users/xiaowyu/xwill/lazycache/cache_test.go` - 单元测试（约 400 行）
+- `/codepath/lazycache/go.mod` - Go module 初始化
+- `/codepath/lazycache/cache.go` - 核心缓存逻辑（约 300 行）
+- `/codepath/lazycache/item.go` - Item 定义（约 30 行）
+- `/codepath/lazycache/lru.go` - LRU 实现（约 100 行）
+- `/codepath/lazycache/loader.go` - Loader 接口（约 20 行）
+- `/codepath/lazycache/options.go` - Options 定义（约 80 行）
+- `/codepath/lazycache/stats.go` - 统计功能（约 50 行）
+- `/codepath/lazycache/errors.go` - 错误定义（约 15 行）
+- `/codepath/lazycache/cache_test.go` - 单元测试（约 400 行）
 
 预计总代码量：约 1000 行（不含示例和文档）

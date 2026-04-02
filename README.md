@@ -1,18 +1,20 @@
 # LazyCache
 
+**English | [中文](README_CN.md)**
+
 A high-performance, lazy-loading cache middleware for Go with LRU eviction, anti-stampede protection, and zero-blocking queries.
 
 ## Features
 
-🚀 **Zero-Blocking Queries** - When cache expires, immediately return stale value and refresh in background
-🛡️ **Anti-Stampede** - Single-key level loading deduplication prevents cache stampede
-🔒 **Anti-Penetration** - Null value caching prevents repeated queries for non-existent keys
-⚡ **High Performance** - 16M+ ops/sec for Get operations, <100ns latency
-🔧 **Hot Configuration** - Runtime updates of cache size, TTL, and other parameters
-📊 **Smart Eviction** - LRU strategy with dual limits (item count + byte size)
-🎯 **Type Safety** - Generic implementation for compile-time type safety
-🔌 **Multiple Loaders** - Register and switch between different data sources
-📈 **Built-in Metrics** - Track hits, misses, evictions, and refresh performance
+- 🚀 **Zero-Blocking Queries** - When cache expires, immediately return stale value and refresh in background
+- 🛡️ **Anti-Stampede** - Single-key level loading deduplication prevents cache stampede
+- 🔒 **Anti-Penetration** - Null value caching prevents repeated queries for non-existent keys
+- ⚡ **High Performance** - 16M+ ops/sec for Get operations, <100ns latency
+- 🔧 **Hot Configuration** - Runtime updates of cache size, TTL, and other parameters
+- 📊 **Smart Eviction** - LRU strategy with dual limits (item count + byte size)
+- 🎯 **Type Safety** - Generic implementation for compile-time type safety
+- 🔌 **Multiple Loaders** - Register and switch between different data sources
+- 📈 **Built-in Metrics** - Track hits, misses, evictions, and refresh performance
 
 ## Installation
 
