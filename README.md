@@ -1,5 +1,8 @@
 # LazyCache
 
+[![CI](https://github.com/ZebraKK/lazycache/actions/workflows/ci.yml/badge.svg)](https://github.com/ZebraKK/lazycache/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/ZebraKK/lazycache)](https://go.dev/doc/install)
+
 **English | [中文](README_CN.md)**
 
 A high-performance, lazy-loading cache middleware for Go with LRU eviction, anti-stampede protection, and zero-blocking queries.
