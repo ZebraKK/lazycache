@@ -195,7 +195,7 @@ func TestLRUEvictionByCount(t *testing.T) {
 	cache.Set("key3", "value3")
 
 	// Access key1 to make it more recently used
-	cache.Get(context.Background(), "key1")
+	_, _ = cache.Get(context.Background(), "key1")
 
 	// Add key4, should evict key2 (least recently used)
 	cache.Set("key4", "value4")
@@ -424,7 +424,7 @@ func TestConcurrentAccess(t *testing.T) {
 		// Concurrent reads
 		go func(id int) {
 			defer wg.Done()
-			cache.Get(context.Background(), "key", WithLoader("test"), WithSync())
+			_, _ = cache.Get(context.Background(), "key", WithLoader("test"), WithSync())
 		}(i)
 
 		// Concurrent writes
@@ -614,7 +614,7 @@ func TestLoggerAsyncRefresh(t *testing.T) {
 	}), WithTTL[string](50*time.Millisecond))
 
 	// Prime the cache synchronously.
-	cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	_, _ = cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
 
 	// Wait for TTL to expire.
 	time.Sleep(80 * time.Millisecond)
@@ -623,7 +623,7 @@ func TestLoggerAsyncRefresh(t *testing.T) {
 	ctx := NewContext(context.Background(), ml)
 
 	// Async get on expired key.
-	cache.Get(ctx, "key1", WithLoader("test"))
+	_, _ = cache.Get(ctx, "key1", WithLoader("test"))
 
 	if !ml.hasDebug("async refresh") {
 		t.Fatal("expected 'async refresh' debug log")
@@ -648,14 +648,14 @@ func TestLoggerRefreshFailed(t *testing.T) {
 	}), WithTTL[string](50*time.Millisecond))
 
 	// Prime the cache.
-	cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	_, _ = cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
 
 	time.Sleep(80 * time.Millisecond)
 
 	ml := &mockLogger{}
 	ctx := NewContext(context.Background(), ml)
 
-	cache.Get(ctx, "key1", WithLoader("test"))
+	_, _ = cache.Get(ctx, "key1", WithLoader("test"))
 
 	// Wait for background goroutine.
 	time.Sleep(50 * time.Millisecond)
@@ -695,7 +695,7 @@ func TestLoaderPanicSync(t *testing.T) {
 	// A second Get must not hang — loadChan was closed despite the panic.
 	done := make(chan struct{})
 	go func() {
-		cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+		_, _ = cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
 		close(done)
 	}()
 	select {
@@ -965,7 +965,7 @@ func TestAsyncRefreshPanic(t *testing.T) {
 	}), WithTTL[string](ttl))
 
 	// Prime the cache.
-	cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	_, _ = cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
 
 	// Force expiry by back-dating the item.
 	cache.mu.Lock()
@@ -1015,7 +1015,7 @@ func TestAsyncRefreshTimeout(t *testing.T) {
 	}), WithTTL[string](ttl), WithLoaderTimeout[string](50*time.Millisecond))
 
 	// Prime the cache.
-	cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
+	_, _ = cache.Get(context.Background(), "key1", WithLoader("test"), WithSync())
 
 	// Force expiry by back-dating the item.
 	cache.mu.Lock()
@@ -1091,7 +1091,7 @@ func TestMaybeTouchLRUPrecision(t *testing.T) {
 	// LRU order: [key2(MRU), key1(LRU)]
 
 	// First read of key1 after its Set → n==1 → Touch → key1 becomes MRU.
-	cache.Get(context.Background(), "key1")
+	_, _ = cache.Get(context.Background(), "key1")
 	// LRU order should now be: [key1(MRU), key2(LRU)]
 
 	// Adding key3 must evict key2 (LRU), not key1.
@@ -1120,12 +1120,12 @@ func TestMaybeTouchLRUPrecision(t *testing.T) {
 	cache2.Set("keyB", "vB")
 	// LRU: [keyB(MRU), keyA(LRU)]
 
-	cache2.Get(context.Background(), "keyA") // n=1 → Touch → LRU: [keyA, keyB]
-	cache2.Get(context.Background(), "keyB") // n=1 → Touch → LRU: [keyB, keyA]
+	_, _ = cache2.Get(context.Background(), "keyA") // n=1 → Touch → LRU: [keyA, keyB]
+	_, _ = cache2.Get(context.Background(), "keyB") // n=1 → Touch → LRU: [keyB, keyA]
 
 	// Reads 2..touchEveryN-1 of keyA: all throttled, no Touch, keyA stays LRU.
 	for i := 0; i < touchEveryN-2; i++ {
-		cache2.Get(context.Background(), "keyA")
+		_, _ = cache2.Get(context.Background(), "keyA")
 	}
 	// keyA.readCount == touchEveryN-1; next read would be touchEveryN (Touch fires).
 	// But we stop here: keyA is still LRU.
@@ -1160,7 +1160,7 @@ func TestConcurrentRegisterLoader(t *testing.T) {
 		}(name)
 		go func() {
 			defer wg.Done()
-			cache.Get(context.Background(), "key", WithSync())
+			_, _ = cache.Get(context.Background(), "key", WithSync())
 		}()
 	}
 	wg.Wait()
@@ -1173,7 +1173,7 @@ func BenchmarkCacheGet(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cache.Get(context.Background(), "key")
+		_, _ = cache.Get(context.Background(), "key")
 	}
 }
 
@@ -1194,7 +1194,7 @@ func BenchmarkCacheConcurrent(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			cache.Get(context.Background(), "key")
+			_, _ = cache.Get(context.Background(), "key")
 		}
 	})
 }
