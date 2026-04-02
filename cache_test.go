@@ -3,6 +3,7 @@ package lazycache
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1138,6 +1139,31 @@ func TestMaybeTouchLRUPrecision(t *testing.T) {
 	if err != nil {
 		t.Fatal("keyB should still be in cache")
 	}
+}
+
+// TestConcurrentRegisterLoader verifies that RegisterLoader and Get can be called
+// concurrently without data races, exercising the dedicated loadersMu lock.
+func TestConcurrentRegisterLoader(t *testing.T) {
+	cache := New[string]("loader0", LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+		return "v0", nil
+	}))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(2)
+		name := fmt.Sprintf("loader%d", i+1)
+		go func(n string) {
+			defer wg.Done()
+			cache.RegisterLoader(n, LoaderFunc[string](func(ctx context.Context, key string) (string, error) {
+				return "v_" + n, nil
+			}))
+		}(name)
+		go func() {
+			defer wg.Done()
+			cache.Get(context.Background(), "key", WithSync())
+		}()
+	}
+	wg.Wait()
 }
 
 // Benchmark Get operations

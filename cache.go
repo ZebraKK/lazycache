@@ -12,7 +12,8 @@ import (
 
 // Cache is a generic lazy-loading cache with LRU eviction
 type Cache[V any] struct {
-	mu            sync.RWMutex
+	mu            sync.RWMutex // protects items, lru, currentSize
+	loadersMu     sync.RWMutex // protects loaders (read-heavy, rarely written)
 	items         map[string]*item[V]
 	maxItems      int
 	maxBytes      int64
@@ -59,9 +60,10 @@ func New[V any](name string, loader Loader[V], opts ...Option[V]) *Cache[V] {
 	}
 	c := &Cache[V]{
 		items:         make(map[string]*item[V]),
-		maxItems:      10000,           // default max items
-		maxBytes:      1 << 30,         // default 1GB
-		ttl:           5 * time.Minute, // default 5 minutes
+		maxItems:      10000,            // default max items
+		maxBytes:      1 << 30,          // default 1GB
+		ttl:           5 * time.Minute,  // default 5 minutes
+		loaderTimeout: 30 * time.Second, // default 30 seconds
 		lru:           newLRUList[V](),
 		loaders:       make(map[string]Loader[V]),
 		sizeEstimator: defaultSizeEstimator[V],
@@ -81,8 +83,8 @@ func (c *Cache[V]) RegisterLoader(name string, loader Loader[V]) {
 	if loader == nil {
 		panic("lazycache: loader must not be nil")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.loadersMu.Lock()
+	defer c.loadersMu.Unlock()
 	c.loaders[name] = loader
 }
 
@@ -400,7 +402,7 @@ func (c *Cache[V]) evictIfNeeded() {
 }
 
 // pickLoader randomly selects a loader from the registered loaders.
-// Must be called with c.mu.RLock held.
+// Must be called with c.loadersMu.RLock held.
 func (c *Cache[V]) pickLoader() Loader[V] {
 	for _, l := range c.loaders {
 		return l
@@ -410,8 +412,8 @@ func (c *Cache[V]) pickLoader() Loader[V] {
 
 // getLoader retrieves a loader by name, or auto-selects one when name is empty.
 func (c *Cache[V]) getLoader(name string) Loader[V] {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.loadersMu.RLock()
+	defer c.loadersMu.RUnlock()
 
 	if name == "" {
 		return c.pickLoader()
