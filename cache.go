@@ -231,6 +231,34 @@ func (c *Cache[V]) Size() int64 {
 	return c.currentSize
 }
 
+/*
+多个 goroutine 并发请求同一个 key（缓存未命中）
+         │
+         ▼
+    c.mu.Lock()  ← 所有 goroutine 争抢锁
+         │
+    ┌────┴─────────────────────┐
+    │                          │
+ 第 1 个 goroutine            第 2、3、N 个 goroutine
+ 抢到锁，发现 loading=false   抢到锁，发现 loading=true
+    │                          │
+ it.loading = true             ch := it.loadChan
+ it.loadChan = make(chan struct{})
+ c.mu.Unlock()                 c.mu.Unlock()
+    │                          │
+ 执行 loader.Load(...)          select { case <-ch: ... }
+    │                          │       ← 阻塞等待
+ 成功/失败                      │
+    │                          │
+ c.mu.Lock()                   │
+ 更新 it.value                 │
+ it.loading = false            │
+ close(it.loadChan) ──────────►│ channel 关闭，所有等待者同时解除阻塞
+ c.mu.Unlock()                 │
+                               │
+                          重新读取 c.items[key]
+                          返回已加载好的值
+*/
 // syncLoad loads a value synchronously with anti-stampede protection
 func (c *Cache[V]) syncLoad(ctx context.Context, key string, loaderName string, loader Loader[V], ttlOverride *time.Duration) (V, error) {
 	l := fromContext(ctx)
@@ -246,6 +274,16 @@ func (c *Cache[V]) syncLoad(ctx context.Context, key string, loaderName string, 
 		c.mu.Unlock()
 
 		// Wait for the other goroutine to finish loading
+		// vs sync.WaitGroup or sync.Cond:
+		// - channel close is more efficient than broadcasting to all waiters via Cond
+		// - avoids potential goroutine leaks if waiters time out or are canceled while waiting
+		// - allows waiters to select on ctx.Done() for cancellation, which Cond does not support
+		// - avoids the thundering herd problem on Cond.Broadcast if many waiters are present
+		// - Note: this means that if the loader goroutine panics or gets stuck, all waiters will also be affected.
+		// 		This is a trade-off for simplicity and performance.
+		//   Alternative designs could involve more complex coordination
+		// 	 (e.g. separate "loading" state with a sync.Cond or a wait group),
+		//   but the channel approach is simple and efficient for the common case where loaders succeed quickly.
 		select {
 		case <-ch:
 			c.mu.RLock()
@@ -255,7 +293,7 @@ func (c *Cache[V]) syncLoad(ctx context.Context, key string, loaderName string, 
 				return zero[V](), ErrNotFound
 			}
 			return loadedItem.value, nil
-		case <-ctx.Done():
+		case <-ctx.Done(): // context 超时或取消
 			return zero[V](), ctx.Err()
 		}
 	}
@@ -279,7 +317,7 @@ func (c *Cache[V]) syncLoad(ctx context.Context, key string, loaderName string, 
 	if ttlOverride != nil {
 		ttl = *ttlOverride
 	}
-
+	//在 `Lock` 保护下先写值、再 `close`"来保证内存可见性和数据一致性
 	if err != nil && isTransientError(err) {
 		if exists && !it.isNull {
 			// Stale real value available: extend TTL and return it silently.
